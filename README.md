@@ -136,6 +136,16 @@ Need an activation code? Contact us:
 - **WeChat**: Join the user group (coming soon)
 - **GitHub Issues**: [Open an issue](https://github.com/goddeng/Claude-Portable/issues)
 
+## Sponsor
+
+If this project helps you, consider buying me a coffee :)
+
+<p align="center">
+  <img src=".github/alipay.png" width="250" alt="Alipay QR Code">
+  <br>
+  <em>Scan with Alipay</em>
+</p>
+
 ## License
 
 MIT License - See [LICENSE](LICENSE) file.
