@@ -1,0 +1,7 @@
+{
+    "server": "your-proxy-server.com",
+    "server_port": 12345,
+    "method": "aes-256-gcm",
+    "password": "your-password-here",
+    "timeout": 300
+}
