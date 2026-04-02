@@ -62,7 +62,7 @@ cd Claude-Portable
 
 # 2. Configure server
 cp configs/server.env.example configs/server.env
-# Edit: set ENCRYPT_KEY, INTERNAL_PREFIXES, credential paths
+# Edit: set ENCRYPT_KEY, credential paths
 
 # 3. Configure client
 cp configs/client.env.example configs/client.env
