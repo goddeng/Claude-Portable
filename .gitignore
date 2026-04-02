@@ -1,0 +1,30 @@
+dist/
+build/
+*.zip
+*.tar.gz
+
+# Credentials & secrets - NEVER commit
+configs/credentials.env
+configs/ss-config.json
+configs/server.env
+configs/client.env
+
+# Database
+server/license.db
+server/license.db-wal
+server/license.db-shm
+
+# Node modules
+node_modules/
+
+# Runtime data
+data/
+.credentials.json
+.claude.json
+.license.json
+.ss_args
+.heartbeat.json
+
+# OS files
+.DS_Store
+Thumbs.db

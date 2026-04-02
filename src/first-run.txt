@@ -1,0 +1,18 @@
+Claude Code Portable
+====================
+
+Usage:
+  Windows : Double-click claude.bat
+  macOS   : Double-click claude.command
+  Linux   : Run ./claude.sh in terminal
+
+Directory Structure:
+  runtime/     - Node.js and Claude Code (do not modify)
+  data/        - Your credentials and config (keep secure)
+
+Security Notice:
+  This package contains your authentication credentials.
+  Treat it like a password - do not share or leave unattended.
+
+To update Claude Code:
+  Re-run the build script from the source project.
