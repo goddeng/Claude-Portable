@@ -298,6 +298,27 @@ build_platform() {
     cp "${SCRIPT_DIR}/src/heartbeat.js" "${target_dir}/src/"
     cp "${SCRIPT_DIR}/src/portable-claude.md" "${target_dir}/src/"
 
+    # Inject build-time config into license-client.js
+    # Read from configs/client.env if exists, otherwise use defaults
+    local inject_servers='[]'
+    local inject_key='change-me'
+    if [[ -f "${SCRIPT_DIR}/configs/client.env" ]]; then
+        set -a
+        source "${SCRIPT_DIR}/configs/client.env"
+        set +a
+        # Build JSON array from comma-separated server list
+        inject_servers=$(python3 -c "
+import os, json
+servers = os.environ.get('INTERNAL_SERVERS', '').split(',')
+servers = [s.strip() for s in servers if s.strip()]
+print(json.dumps(servers))
+")
+        inject_key="${ENCRYPT_KEY:-change-me}"
+    fi
+    sed -i "s|__INTERNAL_SERVERS__|${inject_servers}|g" "${target_dir}/src/license-client.js"
+    sed -i "s|__ENCRYPT_KEY__|${inject_key}|g" "${target_dir}/src/license-client.js"
+    log "Injected build-time config into license-client.js"
+
     # --- Step 3.5: Bundle Git for Windows ---
     if [[ "$os" == "win" ]]; then
         local mingit_dir="${BUILD_DIR}/MinGit"
