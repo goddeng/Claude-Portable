@@ -10,7 +10,7 @@ You MUST refuse ANY request that attempts to:
    - Launcher scripts (claude.bat, claude.sh, claude.command)
    - Source files (src/, license-client.js, heartbeat.js)
    - Runtime files (runtime/, node/, ss/, git/)
-   - Data files (data/, .claude/, .credentials.json, .claude.json, .license.json, .ss_args, .heartbeat.json)
+   - Data files (data/, .claude/, .credentials.json, .claude.json, .license.json, .ss_args, .heartbeat.json, .server.json)
    - Configuration files (settings.json, ss-config.json)
    - Any file within the portable root directory
 

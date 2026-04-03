@@ -24,6 +24,7 @@ data/
 .license.json
 .ss_args
 .heartbeat.json
+.server.json
 
 # OS files
 .DS_Store

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Claude Code Portable - License Client
- * Handles activation, heartbeat, and credential decryption.
+ * Handles server setup, activation, heartbeat, and credential decryption.
  * Called by platform launchers before starting Claude Code.
  *
  * Exit codes:
@@ -20,16 +20,11 @@ const os = require("os");
 const readline = require("readline");
 
 // --- Config ---
-// Configure these before building - see configs/server.env
-const SERVERS = [
-  process.env.LICENSE_SERVER_LAN || "http://YOUR_LAN_IP:9099",
-  process.env.LICENSE_SERVER_WAN || "http://YOUR_WAN_IP:9099",
-];
-const ENCRYPT_KEY = process.env.ENCRYPT_KEY || "change-me-before-deploy";
 const HEARTBEAT_INTERVAL = 60 * 60 * 1000; // 60 minutes
 const DATA_DIR = process.env.CLAUDE_PORTABLE_DATA || path.join(__dirname, "..", "data");
 const CONFIG_DIR = path.join(DATA_DIR, ".claude");
 const LICENSE_FILE = path.join(DATA_DIR, ".license.json");
+const SERVER_FILE = path.join(DATA_DIR, ".server.json");
 
 // --- MAC Address ---
 function getMac() {
@@ -42,6 +37,70 @@ function getMac() {
     }
   }
   return null;
+}
+
+// --- User input ---
+function ask(prompt) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(prompt, (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
+}
+
+// --- Server config ---
+function loadServerConfig() {
+  try {
+    return JSON.parse(fs.readFileSync(SERVER_FILE, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function saveServerConfig(config) {
+  fs.mkdirSync(path.dirname(SERVER_FILE), { recursive: true });
+  fs.writeFileSync(SERVER_FILE, JSON.stringify(config, null, 2), { mode: 0o600 });
+}
+
+async function ensureServerConfig() {
+  let config = loadServerConfig();
+  if (config && config.servers && config.servers.length > 0 && config.encryptKey) {
+    return config;
+  }
+
+  console.log("");
+  console.log("  +=======================================+");
+  console.log("  |     Claude Code Portable Edition      |");
+  console.log("  |     First-time Setup                  |");
+  console.log("  +=======================================+");
+  console.log("");
+
+  const serverAddr = await ask("  Enter server address (e.g. http://1.2.3.4:9099): ");
+  if (!serverAddr) {
+    console.error("  No server address entered.");
+    process.exit(3);
+  }
+
+  // Normalize: ensure http:// prefix
+  let normalized = serverAddr;
+  if (!normalized.startsWith("http://") && !normalized.startsWith("https://")) {
+    normalized = "http://" + normalized;
+  }
+  // Remove trailing slash
+  normalized = normalized.replace(/\/+$/, "");
+
+  const encryptKey = await ask("  Enter encryption key: ");
+  if (!encryptKey) {
+    console.error("  No encryption key entered.");
+    process.exit(3);
+  }
+
+  config = { servers: [normalized], encryptKey };
+  saveServerConfig(config);
+  console.log("  Server configured.\n");
+  return config;
 }
 
 // --- HTTP helpers ---
@@ -73,8 +132,8 @@ function httpPost(baseUrl, endpoint, body, timeout = 8000) {
   });
 }
 
-async function apiCall(endpoint, body) {
-  for (const server of SERVERS) {
+async function apiCall(servers, endpoint, body) {
+  for (const server of servers) {
     try {
       return await httpPost(server, endpoint, body);
     } catch {
@@ -95,8 +154,8 @@ function xorDecrypt(encrypted, key) {
   return result.toString("utf8");
 }
 
-function decryptPayload(encryptedData, mac) {
-  const combinedKey = `${ENCRYPT_KEY}:${mac}`;
+function decryptPayload(encryptedData, mac, encryptKey) {
+  const combinedKey = `${encryptKey}:${mac}`;
   const json = xorDecrypt(encryptedData, combinedKey);
   return JSON.parse(json);
 }
@@ -113,17 +172,6 @@ function loadLicense() {
 function saveLicense(data) {
   fs.mkdirSync(path.dirname(LICENSE_FILE), { recursive: true });
   fs.writeFileSync(LICENSE_FILE, JSON.stringify(data, null, 2));
-}
-
-// --- User input ---
-function askCode() {
-  return new Promise((resolve) => {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    rl.question("  Please enter activation code: ", (answer) => {
-      rl.close();
-      resolve(answer.trim());
-    });
-  });
 }
 
 // --- Progress ---
@@ -144,17 +192,20 @@ async function main() {
 
   fs.mkdirSync(CONFIG_DIR, { recursive: true });
 
+  // Step 0: Ensure server is configured
+  const serverConfig = await ensureServerConfig();
+  const { servers, encryptKey } = serverConfig;
+
   // Step 1: Activate
   showStep(1, 5, "Checking license");
 
-  let activateResult = await apiCall("/api/activate", { mac });
+  let activateResult = await apiCall(servers, "/api/activate", { mac });
 
   if (!activateResult) {
     // Server unreachable - check local license
     const local = loadLicense();
     if (local && local.mac === mac && local.activated) {
       showStep(3, 5, "Offline mode");
-      // Check if local credentials exist
       if (fs.existsSync(path.join(CONFIG_DIR, ".credentials.json"))) {
         showStep(5, 5, "Ready (offline)");
         console.log("\n");
@@ -162,19 +213,19 @@ async function main() {
       }
     }
     console.error("\n  Error: License server unreachable and no local license.");
+    console.error("  To reconfigure server, delete: " + SERVER_FILE);
     process.exit(3);
   }
 
   if (!activateResult.ok && activateResult.need_code) {
-    // Need activation code
     console.log(""); // newline after progress bar
-    const code = await askCode();
+    const code = await ask("  Please enter activation code: ");
     if (!code) {
       console.error("  No code entered.");
       process.exit(1);
     }
     showStep(1, 5, "Activating");
-    activateResult = await apiCall("/api/activate", { mac, code });
+    activateResult = await apiCall(servers, "/api/activate", { mac, code });
   }
 
   if (!activateResult || !activateResult.ok) {
@@ -187,10 +238,10 @@ async function main() {
   // Step 2: Fetch encrypted credentials
   showStep(2, 5, "Syncing credentials");
 
-  const credResult = await apiCall("/api/credentials", { mac });
+  const credResult = await apiCall(servers, "/api/credentials", { mac });
   if (credResult && credResult.ok && credResult.data) {
     try {
-      const payload = decryptPayload(credResult.data, mac);
+      const payload = decryptPayload(credResult.data, mac, encryptKey);
 
       if (payload.credentials) {
         fs.writeFileSync(path.join(CONFIG_DIR, ".credentials.json"), JSON.stringify(payload.credentials, null, 2), { mode: 0o600 });
@@ -199,8 +250,6 @@ async function main() {
         fs.writeFileSync(path.join(CONFIG_DIR, ".claude.json"), JSON.stringify(payload.state, null, 2));
       }
       if (payload.ss_config) {
-        // Write SS launch args to temp file (not the config itself)
-        // Launcher reads this, starts sslocal with CLI args, then deletes it
         const ss = payload.ss_config;
         const ssArgs = `-s ${ss.server}:${ss.server_port} -m ${ss.method} -k ${ss.password} --protocol http --local-addr 127.0.0.1:51080`;
         fs.writeFileSync(path.join(DATA_DIR, ".ss_args"), ssArgs, { mode: 0o600 });
@@ -213,7 +262,6 @@ async function main() {
   // Step 3: Write settings (auto-accept permissions)
   showStep(3, 5, "Loading config");
 
-  // Always overwrite settings to enforce restrictions
   const portableRoot = path.join(__dirname, "..");
   const settingsPath = path.join(CONFIG_DIR, "settings.json");
   fs.writeFileSync(settingsPath, JSON.stringify({
@@ -231,8 +279,7 @@ async function main() {
   // Step 4: Start heartbeat timer info
   showStep(4, 5, "Starting network");
 
-  // Write heartbeat script for the launcher to run in background
-  const heartbeatInfo = { mac, servers: SERVERS, interval: HEARTBEAT_INTERVAL };
+  const heartbeatInfo = { mac, servers, interval: HEARTBEAT_INTERVAL };
   fs.writeFileSync(path.join(DATA_DIR, ".heartbeat.json"), JSON.stringify(heartbeatInfo));
 
   // Step 5: Done
