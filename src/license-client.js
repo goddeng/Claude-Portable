@@ -232,6 +232,21 @@ async function main() {
     process.exit(3);
   }
 
+  // Saved code is no longer valid (revoked / expired / taken by another device).
+  // Drop it and re-prompt — otherwise the user is stuck forever.
+  const staleSavedCode = savedCode && !result.ok && !result.need_code && (
+    /invalid|revoked|expired|already used|another device/i.test(result.error || "")
+  );
+  if (staleSavedCode) {
+    console.log("");
+    console.error(`  Saved activation code is no longer valid: ${result.error}`);
+    console.log("  Please enter a new activation code (contact admin if needed).");
+    try { fs.unlinkSync(SERVER_FILE); } catch {}
+    try { fs.unlinkSync(LICENSE_FILE); } catch {}
+    savedCode = null;
+    result = { ok: false, need_code: true };
+  }
+
   // Need activation code
   if (!result.ok && result.need_code) {
     console.log("");

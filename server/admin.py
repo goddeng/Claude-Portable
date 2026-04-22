@@ -92,14 +92,19 @@ def cmd_revoke(args):
 
     if args.code:
         code_hash = hashlib.sha256(args.code.encode()).hexdigest()
-        db.execute("UPDATE codes SET revoked = 1 WHERE code_hash = ?", (code_hash,))
-        # Also remove activation
+        db.execute(
+            "UPDATE codes SET revoked = 1, used_by_mac = NULL, used_at = NULL WHERE code_hash = ?",
+            (code_hash,),
+        )
         db.execute("DELETE FROM activations WHERE code_hash = ?", (code_hash,))
     elif args.mac:
         mac = args.mac.replace(":", "").replace("-", "").lower()
         activation = db.execute("SELECT code_hash FROM activations WHERE mac_address = ?", (mac,)).fetchone()
         if activation:
-            db.execute("UPDATE codes SET revoked = 1 WHERE code_hash = ?", (activation["code_hash"],))
+            db.execute(
+                "UPDATE codes SET revoked = 1, used_by_mac = NULL, used_at = NULL WHERE code_hash = ?",
+                (activation["code_hash"],),
+            )
         db.execute("DELETE FROM activations WHERE mac_address = ?", (mac,))
     else:
         print("Error: specify --code or --mac")
@@ -140,8 +145,14 @@ def cmd_generate(args):
 
     db = get_db()
     count = args.count
-    days = args.days or 30
-    expires = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+
+    if args.permanent:
+        expires = None
+        expires_label = "permanent"
+    else:
+        days = args.days or 30
+        expires = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        expires_label = expires
 
     generated = []
     for _ in range(count):
@@ -156,7 +167,7 @@ def cmd_generate(args):
             continue
 
     db.commit()
-    print(f"Generated {len(generated)} codes (expires: {expires}):\n")
+    print(f"Generated {len(generated)} codes (expires: {expires_label}):\n")
     for c in generated:
         print(f"  {c}")
 
@@ -223,7 +234,8 @@ def main():
     # generate
     p = sub.add_parser("generate", help="Generate codes manually")
     p.add_argument("--count", type=int, default=10, help="Number of codes")
-    p.add_argument("--days", type=int, default=30, help="Expiry in days")
+    p.add_argument("--days", type=int, default=30, help="Expiry in days (ignored if --permanent)")
+    p.add_argument("--permanent", action="store_true", help="Generate permanent codes (no expiry)")
     p.add_argument("--note", help="Note for the codes")
 
     # note
