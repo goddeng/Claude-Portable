@@ -21,6 +21,15 @@ set "CLAUDE_PORTABLE_DATA=%DATA_DIR%"
 set "CLAUDE_CODE_GIT_BASH_PATH=%GIT_DIR%\usr\bin\bash.exe"
 if not exist "%CLAUDE_CONFIG_DIR%" mkdir "%CLAUDE_CONFIG_DIR%"
 
+REM --- License kill-switch (set by heartbeat on explicit revoke/expire) ---
+if exist "%DATA_DIR%\.license_expired" (
+    echo.
+    echo   License has been revoked or expired. Please contact administrator.
+    del /q "%DATA_DIR%\.license_expired" >nul 2>&1
+    pause
+    exit /b 2
+)
+
 REM --- License check + credential sync ---
 "%NODE_DIR%\node.exe" "%SRC_DIR%\license-client.js"
 if %errorlevel% neq 0 (

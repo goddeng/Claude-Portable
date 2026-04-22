@@ -16,6 +16,14 @@ export CLAUDE_CONFIG_DIR="${DATA_DIR}/.claude"
 export CLAUDE_PORTABLE_DATA="${DATA_DIR}"
 mkdir -p "${CLAUDE_CONFIG_DIR}"
 
+# --- License kill-switch (set by heartbeat on explicit revoke/expire) ---
+if [[ -f "${DATA_DIR}/.license_expired" ]]; then
+    echo ""
+    echo "  License has been revoked or expired. Please contact administrator."
+    rm -f "${DATA_DIR}/.license_expired"
+    exit 2
+fi
+
 # --- License check + credential sync ---
 "${NODE_DIR}/bin/node" "${SRC_DIR}/license-client.js"
 if [[ $? -ne 0 ]]; then

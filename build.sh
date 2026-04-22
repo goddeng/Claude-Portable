@@ -148,6 +148,56 @@ ss_binary_name() {
 }
 
 # =============================================================================
+# Release gate: scan staged output for forbidden strings.
+# Every regex is a "should never leak into a client package" invariant.
+# Extend this list whenever a new category of secret is added.
+# =============================================================================
+scan_leaks() {
+    local target="$1"
+    local banned=(
+        # Previously leaked (v1.0.2~v1.0.4) — must never appear again
+        'claude-portable-2026'
+        '192\.168\.5\.109'
+        '116\.6\.115\.22'
+        # Structural: client no longer hardcodes server addresses
+        'INTERNAL_SERVERS[[:space:]]*='
+        'ENCRYPT_KEY[[:space:]]*='
+        # Raw Anthropic OAuth / API keys should never be bundled at build time
+        'sk-ant-'
+        # SS password leak sanity check — field name in plaintext config
+        '"password"[[:space:]]*:[[:space:]]*"[^"]'
+        # Catch stray TLS private key material
+        '-----BEGIN (RSA |EC |)PRIVATE KEY-----'
+    )
+
+    # Exclude dirs that legitimately contain these patterns (third-party binaries, tls samples, etc.)
+    local scan_root="${target}"
+    local tmpfile
+    tmpfile=$(mktemp)
+
+    local failed=0
+    for pat in "${banned[@]}"; do
+        # -I: skip binary files; -r: recursive; -E: extended regex
+        # Exclude node_modules (third-party), runtime/* (downloaded binaries), and the ss binary dir
+        if grep -IrnE --exclude-dir=node_modules --exclude-dir=runtime --exclude-dir=tls "$pat" "$scan_root" > "$tmpfile" 2>/dev/null; then
+            if [[ -s "$tmpfile" ]]; then
+                echo ""
+                echo -e "${RED}[LEAK]${NC} pattern '$pat' found in ${scan_root}:" >&2
+                sed 's/^/    /' "$tmpfile" >&2
+                failed=1
+            fi
+        fi
+    done
+    rm -f "$tmpfile"
+
+    if [[ $failed -ne 0 ]]; then
+        return 1
+    fi
+    log "Release gate passed (no banned strings in ${target##*/})"
+    return 0
+}
+
+# =============================================================================
 # Build one platform
 # =============================================================================
 build_platform() {
@@ -337,26 +387,24 @@ build_platform() {
     cp "${SCRIPT_DIR}/src/heartbeat.js" "${target_dir}/src/"
     cp "${SCRIPT_DIR}/src/portable-claude.md" "${target_dir}/src/"
 
-    # Inject build-time config into license-client.js
-    # Read from configs/client.env if exists, otherwise use defaults
-    local inject_servers='[]'
-    local inject_key='change-me'
+    # Inject ONLY the SPKI pin. No server addresses, no keys, no activation codes.
+    # SPKI pin = sha256(pubkey DER) base64 — a public value, safe to embed.
+    local spki_pin=""
     if [[ -f "${SCRIPT_DIR}/configs/client.env" ]]; then
         set -a
         source "${SCRIPT_DIR}/configs/client.env"
         set +a
-        # Build JSON array from comma-separated server list
-        inject_servers=$(python3 -c "
-import os, json
-servers = os.environ.get('INTERNAL_SERVERS', '').split(',')
-servers = [s.strip() for s in servers if s.strip()]
-print(json.dumps(servers))
-")
-        inject_key="${ENCRYPT_KEY:-change-me}"
+        spki_pin="${SPKI_PIN:-}"
     fi
-    sed -i "s|__INTERNAL_SERVERS__|${inject_servers}|g" "${target_dir}/src/license-client.js"
-    sed -i "s|__ENCRYPT_KEY__|${inject_key}|g" "${target_dir}/src/license-client.js"
-    log "Injected build-time config into license-client.js"
+    if [[ -z "$spki_pin" ]]; then
+        error "SPKI_PIN not set in configs/client.env. Generate with:
+  openssl x509 -in server/tls/cert.pem -pubkey -noout \\
+    | openssl pkey -pubin -outform DER \\
+    | openssl dgst -sha256 -binary | base64"
+    fi
+    sed -i "s|__SPKI_PIN__|${spki_pin}|g" "${target_dir}/src/license-client.js"
+    sed -i "s|__SPKI_PIN__|${spki_pin}|g" "${target_dir}/src/heartbeat.js"
+    log "Injected SPKI pin (${#spki_pin} chars) into client scripts"
 
     # --- Step 3.5: Bundle Git for Windows ---
     if [[ "$os" == "win" ]]; then
@@ -387,6 +435,12 @@ print(json.dumps(servers))
 
     # Copy first-run notice
     cp "${SCRIPT_DIR}/src/first-run.txt" "${target_dir}/README.txt"
+
+    # --- Step 4.9: Release gate — scan for banned strings in the staged tree ---
+    # Every pattern below represents either a previously-leaked secret (must stay
+    # out forever) or a structural invariant (e.g. real IPs shouldn't appear in a
+    # client package since clients no longer embed server addresses).
+    scan_leaks "$target_dir" || error "Release gate FAILED for ${target_name} — see above"
 
     # --- Step 5: Package ---
     log "Packaging..."

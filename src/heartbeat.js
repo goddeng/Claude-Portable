@@ -1,40 +1,62 @@
 #!/usr/bin/env node
 /**
- * Heartbeat daemon - runs in background, checks license every 60 minutes.
- * If license invalid, writes a flag file that the launcher checks.
+ * Heartbeat daemon (v1.0.5+) — HTTPS w/ SPKI pin + Bearer auth.
+ * Runs in background, pings license server every 60 min.
+ * Writes .license_expired flag on explicit revoke/expire; stays quiet on network errors.
  */
 
 const fs = require("fs");
 const path = require("path");
-const http = require("http");
+const crypto = require("crypto");
 const https = require("https");
+
+const SPKI_PIN = "__SPKI_PIN__";
 
 const DATA_DIR = process.env.CLAUDE_PORTABLE_DATA || path.join(__dirname, "..", "data");
 const HEARTBEAT_FILE = path.join(DATA_DIR, ".heartbeat.json");
 const KILL_FLAG = path.join(DATA_DIR, ".license_expired");
 
-// Remove any stale kill flag
 try { fs.unlinkSync(KILL_FLAG); } catch {}
 
-function httpPost(baseUrl, endpoint, body, timeout = 8000) {
-  return new Promise((resolve, reject) => {
-    const url = new URL(endpoint, baseUrl);
-    const mod = url.protocol === "https:" ? https : http;
-    const data = JSON.stringify(body);
-    const req = mod.request(url, {
+function httpsPost(baseUrl, endpoint, body, bearerCode, timeout = 8000) {
+  return new Promise((resolve) => {
+    let url;
+    try { url = new URL(endpoint, baseUrl); } catch { return resolve(null); }
+    if (url.protocol !== "https:") return resolve(null);
+
+    const data = JSON.stringify(body || {});
+    const headers = {
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(data),
+    };
+    if (bearerCode) headers["Authorization"] = `Bearer ${bearerCode}`;
+
+    const req = https.request(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) },
+      headers,
       timeout,
+      rejectUnauthorized: false,
+      checkServerIdentity: (_h, cert) => {
+        if (!cert || !cert.pubkey) return new Error("no pubkey");
+        const fpr = crypto.createHash("sha256").update(cert.pubkey).digest("base64");
+        if (fpr !== SPKI_PIN) return new Error("SPKI pin mismatch");
+        return undefined;
+      },
     }, (res) => {
-      let chunks = [];
+      const chunks = [];
       res.on("data", (c) => chunks.push(c));
       res.on("end", () => {
-        try { resolve(JSON.parse(Buffer.concat(chunks).toString())); }
-        catch { reject(new Error("Bad JSON")); }
+        const text = Buffer.concat(chunks).toString();
+        if (res.statusCode === 200) {
+          try { resolve({ ok: true, body: JSON.parse(text) }); }
+          catch { resolve({ ok: false, status: 200 }); }
+        } else {
+          resolve({ ok: false, status: res.statusCode });
+        }
       });
     });
-    req.on("error", reject);
-    req.on("timeout", () => { req.destroy(); reject(new Error("Timeout")); });
+    req.on("error", () => resolve(null));
+    req.on("timeout", () => { req.destroy(); resolve(null); });
     req.write(data);
     req.end();
   });
@@ -44,34 +66,21 @@ async function doHeartbeat() {
   let config;
   try {
     config = JSON.parse(fs.readFileSync(HEARTBEAT_FILE, "utf8"));
-  } catch {
-    return; // No config yet
-  }
+  } catch { return; }
 
-  const { mac, servers } = config;
-  let success = false;
+  const { mac, servers, code } = config;
+  if (!mac || !Array.isArray(servers) || !code) return;
 
   for (const server of servers) {
-    try {
-      const result = await httpPost(server, "/api/heartbeat", { mac });
-      if (result.ok) {
-        success = true;
-        break;
-      }
-      // Server reachable but license invalid
-      if (!result.ok && (result.error?.includes("expired") || result.error?.includes("revoked"))) {
-        fs.writeFileSync(KILL_FLAG, result.error || "License expired");
-        return;
-      }
-    } catch {
-      continue;
-    }
+    const resp = await httpsPost(server, "/api/heartbeat", { mac }, code);
+    if (resp === null) continue;           // network / TLS — try next server
+    if (resp.ok && resp.body?.ok) return;  // happy path
+    // 404 or any non-ok: explicit refusal → license no longer valid for us.
+    fs.writeFileSync(KILL_FLAG, `License refused (HTTP ${resp.status || "?"})`);
+    return;
   }
-
-  // If all servers unreachable, allow continued use (grace period)
-  // The kill flag is only written on explicit rejection
+  // all servers network-unreachable → stay quiet, try again next tick
 }
 
-// Run immediately, then every 60 minutes
 doHeartbeat();
 setInterval(doHeartbeat, 60 * 60 * 1000);

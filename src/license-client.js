@@ -1,31 +1,30 @@
 #!/usr/bin/env node
 /**
- * Claude Code Portable - License Client
+ * Claude Code Portable - License Client (v1.0.5+)
  *
- * Flow:
- *   1. Try internal server silently → if works, auto-activate, done
- *   2. If not, load saved server config from .server.json
- *   3. If no saved config, prompt for server address + activation code
- *   4. Save server + code locally for next time
+ * Security:
+ *   - HTTPS-only. Self-signed cert pinned via SPKI (public key sha256 base64).
+ *   - No server address baked in — user enters it once on first launch.
+ *   - No symmetric key baked in — credential payload is encrypted with a
+ *     per-user key derived from sha256(code+mac).
+ *   - Every authenticated request carries Authorization: Bearer <code>.
  *
  * Exit codes:
  *   0 = success
- *   1 = activation required
+ *   1 = activation required / refused
  *   2 = license expired/revoked
- *   3 = error
+ *   3 = error (network, bad SPKI, etc.)
  */
 
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
-const http = require("http");
 const https = require("https");
 const os = require("os");
 const readline = require("readline");
 
-// --- Build-time config (injected by build.sh, not in GitHub source) ---
-const INTERNAL_SERVERS = __INTERNAL_SERVERS__;
-const ENCRYPT_KEY = "__ENCRYPT_KEY__";
+// --- Build-time injection (NOT a secret — SPKI is a public key hash) ---
+const SPKI_PIN = "__SPKI_PIN__";
 
 // --- Paths ---
 const HEARTBEAT_INTERVAL = 60 * 60 * 1000;
@@ -34,7 +33,7 @@ const CONFIG_DIR = path.join(DATA_DIR, ".claude");
 const LICENSE_FILE = path.join(DATA_DIR, ".license.json");
 const SERVER_FILE = path.join(DATA_DIR, ".server.json");
 
-// --- MAC Address ---
+// --- MAC ---
 function getMac() {
   const interfaces = os.networkInterfaces();
   for (const name of Object.keys(interfaces)) {
@@ -47,7 +46,7 @@ function getMac() {
   return null;
 }
 
-// --- User input ---
+// --- Prompt ---
 function ask(prompt) {
   return new Promise((resolve) => {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -58,42 +57,69 @@ function ask(prompt) {
   });
 }
 
-// --- HTTP helpers ---
-function httpPost(baseUrl, endpoint, body, timeout = 5000) {
-  return new Promise((resolve, reject) => {
-    const url = new URL(endpoint, baseUrl);
-    const mod = url.protocol === "https:" ? https : http;
-    const data = JSON.stringify(body);
-    const req = mod.request(url, {
+// --- HTTPS with SPKI pinning ---
+// Returns:
+//   { ok: true, body } on HTTP 200 w/ JSON
+//   { ok: false, status } on non-200 (incl. 404)
+//   null on network/TLS failure (incl. SPKI mismatch)
+function httpsPost(baseUrl, endpoint, body, bearerCode, timeout = 8000) {
+  return new Promise((resolve) => {
+    let url;
+    try {
+      url = new URL(endpoint, baseUrl);
+    } catch {
+      return resolve(null);
+    }
+    if (url.protocol !== "https:") {
+      // Refuse plain HTTP — v1.0.5+ is HTTPS-only.
+      return resolve(null);
+    }
+
+    const data = JSON.stringify(body || {});
+    const headers = {
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(data),
+    };
+    if (bearerCode) headers["Authorization"] = `Bearer ${bearerCode}`;
+
+    const req = https.request(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) },
+      headers,
       timeout,
+      rejectUnauthorized: false, // self-signed; we enforce SPKI pin ourselves
+      checkServerIdentity: (_host, cert) => {
+        if (!cert || !cert.pubkey) {
+          return new Error("No peer public key");
+        }
+        const actual = crypto.createHash("sha256").update(cert.pubkey).digest("base64");
+        if (actual !== SPKI_PIN) {
+          return new Error(`SPKI pin mismatch (expected ${SPKI_PIN}, got ${actual})`);
+        }
+        return undefined;
+      },
     }, (res) => {
-      let chunks = [];
+      const chunks = [];
       res.on("data", (c) => chunks.push(c));
       res.on("end", () => {
-        try { resolve(JSON.parse(Buffer.concat(chunks).toString())); }
-        catch { reject(new Error("Invalid JSON")); }
+        const text = Buffer.concat(chunks).toString();
+        if (res.statusCode === 200) {
+          try { resolve({ ok: true, body: JSON.parse(text) }); }
+          catch { resolve({ ok: false, status: 200 }); }
+        } else {
+          resolve({ ok: false, status: res.statusCode });
+        }
       });
     });
-    req.on("error", reject);
-    req.on("timeout", () => { req.destroy(); reject(new Error("Timeout")); });
+    req.on("error", () => resolve(null));
+    req.on("timeout", () => { req.destroy(); resolve(null); });
     req.write(data);
     req.end();
   });
 }
 
-async function tryServer(server, endpoint, body, timeout) {
-  try {
-    return await httpPost(server, endpoint, body, timeout);
-  } catch {
-    return null;
-  }
-}
-
-// --- Decryption ---
-function decryptPayload(encryptedData, mac) {
-  const keyHash = crypto.createHash("sha256").update(`${ENCRYPT_KEY}:${mac}`).digest();
+// --- Decrypt credentials (per-user key) ---
+function decryptPayload(encryptedData, code, mac) {
+  const keyHash = crypto.createHash("sha256").update(`${code}:${mac}`).digest();
   const buf = Buffer.from(encryptedData, "base64");
   const result = Buffer.alloc(buf.length);
   for (let i = 0; i < buf.length; i++) {
@@ -111,7 +137,7 @@ function saveJson(file, data) {
   fs.writeFileSync(file, JSON.stringify(data, null, 2), { mode: 0o600 });
 }
 
-// --- Progress ---
+// --- Progress bar ---
 function showStep(step, total, msg) {
   const pct = Math.round((step / total) * 100);
   const filled = Math.round(pct / 5);
@@ -119,30 +145,42 @@ function showStep(step, total, msg) {
   process.stdout.write(`\r  Initializing... [${bar}] ${pct}% ${msg}`);
 }
 
-// --- Write credentials to disk ---
-async function fetchAndWriteCredentials(server, mac) {
-  const credResult = await tryServer(server, "/api/credentials", { mac }, 8000);
-  if (!credResult || !credResult.ok || !credResult.data) return;
+// --- Credential sync (requires active code) ---
+async function fetchAndWriteCredentials(server, mac, code) {
+  const resp = await httpsPost(server, "/api/credentials", { mac }, code, 8000);
+  if (!resp || !resp.ok || !resp.body || !resp.body.ok || !resp.body.data) return false;
 
   try {
-    const payload = decryptPayload(credResult.data, mac);
+    const payload = decryptPayload(resp.body.data, code, mac);
 
     if (payload.credentials) {
-      fs.writeFileSync(path.join(CONFIG_DIR, ".credentials.json"), JSON.stringify(payload.credentials, null, 2), { mode: 0o600 });
+      fs.writeFileSync(
+        path.join(CONFIG_DIR, ".credentials.json"),
+        JSON.stringify(payload.credentials, null, 2),
+        { mode: 0o600 },
+      );
     }
     if (payload.state) {
-      fs.writeFileSync(path.join(CONFIG_DIR, ".claude.json"), JSON.stringify(payload.state, null, 2));
+      fs.writeFileSync(
+        path.join(CONFIG_DIR, ".claude.json"),
+        JSON.stringify(payload.state, null, 2),
+      );
     }
     if (payload.ss_config) {
       const ss = payload.ss_config;
-      fs.writeFileSync(path.join(DATA_DIR, ".ss_args"),
+      fs.writeFileSync(
+        path.join(DATA_DIR, ".ss_args"),
         `-s ${ss.server}:${ss.server_port} -m ${ss.method} -k ${ss.password} --protocol http --local-addr 127.0.0.1:51080`,
-        { mode: 0o600 });
+        { mode: 0o600 },
+      );
     }
-  } catch {}
+    return true;
+  } catch {
+    return false;
+  }
 }
 
-// --- Write settings ---
+// --- Claude settings ---
 function writeSettings() {
   const portableRoot = path.join(__dirname, "..");
   fs.writeFileSync(path.join(CONFIG_DIR, "settings.json"), JSON.stringify({
@@ -156,6 +194,12 @@ function writeSettings() {
   }, null, 2));
 }
 
+// --- Normalize user-entered server address into https://host:port ---
+function normalizeServer(input) {
+  const stripped = input.replace(/^https?:\/\//, "").replace(/\/+$/, "");
+  return "https://" + stripped;
+}
+
 // --- Main ---
 async function main() {
   const mac = getMac();
@@ -163,36 +207,14 @@ async function main() {
 
   fs.mkdirSync(CONFIG_DIR, { recursive: true });
 
-  // ===== Phase 1: Try internal servers silently =====
-  showStep(1, 5, "Checking license");
-
-  for (const server of INTERNAL_SERVERS) {
-    const result = await tryServer(server, "/api/activate", { mac }, 3000);
-    if (result && result.ok) {
-      // Internal network - auto activated
-      saveJson(LICENSE_FILE, { mac, activated: true, server, expires_at: result.expires_at, ts: Date.now() });
-
-      showStep(2, 5, "Syncing credentials");
-      await fetchAndWriteCredentials(server, mac);
-
-      showStep(3, 5, "Loading config");
-      writeSettings();
-
-      showStep(4, 5, "Starting network");
-      saveJson(path.join(DATA_DIR, ".heartbeat.json"), { mac, servers: [server], interval: HEARTBEAT_INTERVAL });
-
-      showStep(5, 5, "Ready");
-      console.log("\n");
-      process.exit(0);
-    }
-  }
-
-  // ===== Phase 2: External mode - use saved or prompt =====
   let savedConfig = loadJson(SERVER_FILE);
   let server = savedConfig?.server;
   let savedCode = savedConfig?.code;
 
-  // If no saved server, prompt
+  // Force https scheme on any previously saved server (old clients saved http://)
+  if (server) server = normalizeServer(server);
+
+  // Prompt server on first run
   if (!server) {
     console.log("");
     console.log("  +=======================================+");
@@ -200,81 +222,78 @@ async function main() {
     console.log("  |     First-time Setup                  |");
     console.log("  +=======================================+");
     console.log("");
-
-    server = await ask("  Enter server address (e.g. 1.2.3.4:9099): ");
-    if (!server) { console.error("  No address entered."); process.exit(3); }
-    if (!server.startsWith("http")) server = "http://" + server;
-    server = server.replace(/\/+$/, "");
+    const input = await ask("  Enter license server (host:port): ");
+    if (!input) { console.error("  No address entered."); process.exit(3); }
+    server = normalizeServer(input);
   }
 
-  // Try activate with saved code first
+  // Prompt code if missing
+  if (!savedCode) {
+    if (!savedConfig) console.log("");
+    const code = await ask("  Enter activation code: ");
+    if (!code) { console.error("  No code entered."); process.exit(1); }
+    savedCode = code;
+  }
+
   showStep(1, 5, "Checking license");
-  let result = null;
 
-  if (savedCode) {
-    result = await tryServer(server, "/api/activate", { mac, code: savedCode }, 8000);
-  }
+  let result = await httpsPost(server, "/api/activate", { mac, code: savedCode }, null, 8000);
 
-  if (!result) {
-    result = await tryServer(server, "/api/activate", { mac }, 8000);
-  }
-
-  if (!result) {
-    console.error("\n  Error: Server unreachable.");
-    // Offline fallback
+  // Network / TLS failure — try offline fallback
+  if (result === null) {
+    console.error("\n  Error: Server unreachable or certificate mismatch.");
     const local = loadJson(LICENSE_FILE);
-    if (local && local.mac === mac && local.activated && fs.existsSync(path.join(CONFIG_DIR, ".credentials.json"))) {
+    if (local && local.mac === mac && local.activated &&
+        fs.existsSync(path.join(CONFIG_DIR, ".credentials.json"))) {
       showStep(5, 5, "Ready (offline)");
       console.log("\n");
       process.exit(0);
     }
-    console.error("  Check server address or network connection.");
+    console.error("  Check network, server address, or that the build's SPKI pin matches the server cert.");
     process.exit(3);
   }
 
-  // Saved code is no longer valid (revoked / expired / taken by another device).
-  // Drop it and re-prompt — otherwise the user is stuck forever.
-  const staleSavedCode = savedCode && !result.ok && !result.need_code && (
-    /invalid|revoked|expired|already used|another device/i.test(result.error || "")
-  );
-  if (staleSavedCode) {
+  // Server refused (404) — saved code is bad or never existed. Prompt anew, retry once.
+  if (!result.ok || !result.body?.ok) {
     console.log("");
-    console.error(`  Saved activation code is no longer valid: ${result.error}`);
-    console.log("  Please enter a new activation code (contact admin if needed).");
+    console.error(`  Activation refused${result.status ? " (HTTP " + result.status + ")" : ""}.`);
+    console.log("  The saved activation code may be invalid. Enter a new one (contact admin if needed).");
     try { fs.unlinkSync(SERVER_FILE); } catch {}
     try { fs.unlinkSync(LICENSE_FILE); } catch {}
-    savedCode = null;
-    result = { ok: false, need_code: true };
-  }
 
-  // Need activation code
-  if (!result.ok && result.need_code) {
-    console.log("");
-    const code = await ask("  Enter activation code: ");
+    const code = await ask("  Activation code: ");
     if (!code) { console.error("  No code entered."); process.exit(1); }
     savedCode = code;
+
     showStep(1, 5, "Activating");
-    result = await tryServer(server, "/api/activate", { mac, code }, 8000);
+    result = await httpsPost(server, "/api/activate", { mac, code: savedCode }, null, 8000);
+    if (!result || !result.ok || !result.body?.ok) {
+      console.error(`\n  Activation failed.`);
+      process.exit(1);
+    }
   }
 
-  if (!result || !result.ok) {
-    console.error(`\n  Activation failed: ${result?.error || "Unknown error"}`);
-    process.exit(result?.error?.includes("expired") ? 2 : 1);
-  }
-
-  // Save server + code for next time
+  // Success — persist server + code, fetch credentials, done.
   saveJson(SERVER_FILE, { server, code: savedCode });
-  saveJson(LICENSE_FILE, { mac, activated: true, server, expires_at: result.expires_at, ts: Date.now() });
+  saveJson(LICENSE_FILE, {
+    mac, activated: true, server,
+    expires_at: result.body.expires_at,
+    ts: Date.now(),
+  });
 
-  // Fetch credentials
   showStep(2, 5, "Syncing credentials");
-  await fetchAndWriteCredentials(server, mac);
+  const credsOk = await fetchAndWriteCredentials(server, mac, savedCode);
+  if (!credsOk) {
+    console.error("\n  Warning: credential sync failed (will retry on next launch).");
+  }
 
   showStep(3, 5, "Loading config");
   writeSettings();
 
   showStep(4, 5, "Starting network");
-  saveJson(path.join(DATA_DIR, ".heartbeat.json"), { mac, servers: [server], interval: HEARTBEAT_INTERVAL });
+  saveJson(path.join(DATA_DIR, ".heartbeat.json"), {
+    mac, servers: [server], interval: HEARTBEAT_INTERVAL, code: savedCode,
+  });
 
   showStep(5, 5, "Ready");
   console.log("\n");

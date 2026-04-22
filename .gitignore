@@ -14,6 +14,11 @@ server/license.db
 server/license.db-wal
 server/license.db-shm
 
+# TLS — private key MUST never be committed. cert.pem is public but we keep
+# the whole directory out of git as a safety belt; the server generates its
+# own cert once and the SPKI fingerprint is what gets distributed to clients.
+server/tls/
+
 # Node modules
 node_modules/
 
