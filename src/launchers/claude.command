@@ -16,6 +16,12 @@ export CLAUDE_CONFIG_DIR="${DATA_DIR}/.claude"
 export CLAUDE_PORTABLE_DATA="${DATA_DIR}"
 mkdir -p "${CLAUDE_CONFIG_DIR}"
 
+# Remove Gatekeeper quarantine on the bundle so bundled binaries (node, sslocal,
+# claude) can execute without "app is damaged" prompts. Silent if already clean.
+if command -v xattr >/dev/null 2>&1; then
+    xattr -dr com.apple.quarantine "${PORTABLE_ROOT}" 2>/dev/null || true
+fi
+
 # --- License check + credential sync ---
 "${NODE_DIR}/bin/node" "${SRC_DIR}/license-client.js"
 if [[ $? -ne 0 ]]; then
@@ -49,11 +55,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# --- Launch Claude Code ---
-CLAUDE_CLI="${CLAUDE_DIR}/node_modules/@anthropic-ai/claude-code/cli.js"
-if [[ ! -f "$CLAUDE_CLI" ]]; then
+# --- Launch Claude Code (native binary, v2.x) ---
+CLAUDE_BIN="${CLAUDE_DIR}/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+if [[ ! -x "$CLAUDE_BIN" ]]; then
     echo "Error: Claude Code not found. Package may be corrupted."
     exit 1
 fi
 
-"${NODE_DIR}/bin/node" "${CLAUDE_CLI}" --system-prompt-file "${SRC_DIR}/portable-claude.md" "$@"
+"${CLAUDE_BIN}" --system-prompt-file "${SRC_DIR}/portable-claude.md" "$@"

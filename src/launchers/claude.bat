@@ -46,15 +46,15 @@ if exist "%SS_BIN%" if exist "%SS_ARGS_FILE%" (
 REM --- Start heartbeat in background ---
 start /b "" "%NODE_DIR%\node.exe" "%SRC_DIR%\heartbeat.js" >nul 2>&1
 
-REM --- Launch Claude Code ---
-set "CLAUDE_CLI=%CLAUDE_DIR%\node_modules\@anthropic-ai\claude-code\cli.js"
-if not exist "%CLAUDE_CLI%" (
+REM --- Launch Claude Code (native binary, v2.x) ---
+set "CLAUDE_BIN=%CLAUDE_DIR%\node_modules\@anthropic-ai\claude-code\bin\claude.exe"
+if not exist "%CLAUDE_BIN%" (
     echo Error: Claude Code not found. Package may be corrupted.
     pause
     exit /b 1
 )
 
-"%NODE_DIR%\node.exe" "%CLAUDE_CLI%" --system-prompt-file "%SRC_DIR%\portable-claude.md" %*
+"%CLAUDE_BIN%" --system-prompt-file "%SRC_DIR%\portable-claude.md" %*
 
 REM --- Cleanup ---
 taskkill /f /im sslocal.exe >nul 2>&1

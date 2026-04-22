@@ -237,23 +237,62 @@ build_platform() {
     # Install into target directory
     mkdir -p "${target_dir}/runtime/claude-code"
 
-    if [[ "$is_native" == true ]]; then
-        # Native build - use bundled node directly
-        "${node_bin}" "${target_dir}/runtime/node/lib/node_modules/npm/bin/npm-cli.js" install \
-            --prefix "${target_dir}/runtime/claude-code" \
-            "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
-            --no-fund --no-audit 2>&1 | tail -5
+    # Claude Code v2 ships a native binary per platform (8 optionalDependencies).
+    # postinstall picks the binary matching the *host*, so cross-builds get the
+    # wrong binary. We install the wrapper with --ignore-scripts, then separately
+    # pull the target platform's sub-package and overwrite bin/claude.exe.
+
+    # Map our (os,arch) to Claude Code's npm platform key
+    local cc_platform
+    case "${os}-${arch}" in
+        darwin-arm64) cc_platform="darwin-arm64" ;;
+        darwin-x64)   cc_platform="darwin-x64" ;;
+        linux-x64)    cc_platform="linux-x64" ;;
+        linux-arm64)  cc_platform="linux-arm64" ;;
+        win-x64)      cc_platform="win32-x64" ;;
+        *) error "No Claude Code native package mapping for ${os}-${arch}" ;;
+    esac
+
+    log "Installing wrapper (no postinstall) for ${cc_platform}..."
+    npm install \
+        --prefix "${target_dir}/runtime/claude-code" \
+        "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+        --ignore-scripts --no-fund --no-audit --force 2>&1 | tail -3
+
+    # Resolve installed wrapper version so native sub-package version matches
+    local wrapper_pkg_json="${target_dir}/runtime/claude-code/node_modules/@anthropic-ai/claude-code/package.json"
+    local cc_version
+    cc_version="$(python3 -c "import json; print(json.load(open('${wrapper_pkg_json}'))['version'])")"
+    log "Wrapper version: ${cc_version}"
+
+    # Pull target platform's native sub-package via `npm pack` (extracts tarball
+    # directly, bypassing npm's optionalDependencies + host-platform filtering)
+    local cc_cache_dir="${BUILD_DIR}/cc-natives"
+    mkdir -p "$cc_cache_dir"
+    local tarball_file="${cc_cache_dir}/claude-code-${cc_platform}-${cc_version}.tgz"
+    if [[ ! -f "$tarball_file" ]]; then
+        log "Downloading claude-code-${cc_platform}@${cc_version} tarball..."
+        local packed
+        packed=$(cd "$cc_cache_dir" && npm pack "@anthropic-ai/claude-code-${cc_platform}@${cc_version}" --silent)
+        mv "${cc_cache_dir}/${packed}" "$tarball_file"
     else
-        # Cross-platform build - use host npm with platform flags
-        log "Cross-build detected (host: ${host_os}-${host_arch_node}, target: ${os}-${arch})"
-        npm install \
-            --prefix "${target_dir}/runtime/claude-code" \
-            "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
-            --os="$npm_os_flag" --cpu="$npm_cpu_flag" \
-            --no-fund --no-audit 2>&1 | tail -5
+        log "Using cached native tarball: $(basename "$tarball_file")"
     fi
 
-    log "Claude Code installed."
+    # Binary lives at top-level of tarball (e.g. package/claude or package/claude.exe)
+    local bin_name="claude"
+    [[ "$cc_platform" == win32-* ]] && bin_name="claude.exe"
+
+    # Extract the single binary we need
+    local wrapper_bin="${target_dir}/runtime/claude-code/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+    tar xzf "$tarball_file" -C "$cc_cache_dir" "package/${bin_name}"
+    cp -f "${cc_cache_dir}/package/${bin_name}" "$wrapper_bin"
+    chmod +x "$wrapper_bin"
+
+    # Clean up extracted staging so next platform doesn't reuse wrong binary
+    rm -rf "${cc_cache_dir}/package"
+
+    log "Installed native binary ($(file -b "$wrapper_bin" | cut -d, -f1-2))"
 
     # --- Step 2.5: Download Shadowsocks ---
     log "Setting up Shadowsocks proxy..."

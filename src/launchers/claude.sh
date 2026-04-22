@@ -49,11 +49,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# --- Launch Claude Code ---
-CLAUDE_CLI="${CLAUDE_DIR}/node_modules/@anthropic-ai/claude-code/cli.js"
-if [[ ! -f "$CLAUDE_CLI" ]]; then
+# --- Launch Claude Code (native binary, v2.x) ---
+CLAUDE_BIN="${CLAUDE_DIR}/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+if [[ ! -x "$CLAUDE_BIN" ]]; then
     echo "Error: Claude Code not found. Package may be corrupted."
     exit 1
 fi
 
-"${NODE_DIR}/bin/node" "${CLAUDE_CLI}" --system-prompt-file "${SRC_DIR}/portable-claude.md" "$@"
+"${CLAUDE_BIN}" --system-prompt-file "${SRC_DIR}/portable-claude.md" "$@"
