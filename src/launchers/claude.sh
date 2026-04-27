@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Claude Code Portable Launcher - Linux
+# Claude Code Portable Launcher - Linux (v1.0.7+)
+#
+# Persistence model: plugins, history, projects, sessions all live under
+# data/.claude on the USB drive. The activation code stays in data/.server.json.
+# Only .credentials.json is treated as transient — wiped on every start and on
+# every clean exit (incl. Ctrl+C) so OAuth tokens never outlast a session.
 # =============================================================================
 set -euo pipefail
 
@@ -12,9 +17,26 @@ SS_DIR="${PORTABLE_ROOT}/runtime/ss"
 SRC_DIR="${PORTABLE_ROOT}/src"
 
 export PATH="${NODE_DIR}/bin:${PATH}"
-export CLAUDE_CONFIG_DIR="${DATA_DIR}/.claude"
 export CLAUDE_PORTABLE_DATA="${DATA_DIR}"
+export CLAUDE_CONFIG_DIR="${DATA_DIR}/.claude"
 mkdir -p "${CLAUDE_CONFIG_DIR}"
+
+CREDS_FILE="${CLAUDE_CONFIG_DIR}/.credentials.json"
+SS_ARGS_FILE="${CLAUDE_CONFIG_DIR}/.ss_args"
+
+# Tokens MUST NOT outlive a session. Wipe before start (in case prior crash)
+# and on any exit (clean, error, signal).
+rm -f "$CREDS_FILE" "$SS_ARGS_FILE"
+
+SS_PID=""
+HEARTBEAT_PID=""
+
+cleanup() {
+    [[ -n "$SS_PID" ]] && kill "$SS_PID" 2>/dev/null || true
+    [[ -n "$HEARTBEAT_PID" ]] && kill "$HEARTBEAT_PID" 2>/dev/null || true
+    rm -f "$CREDS_FILE" "$SS_ARGS_FILE" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
 
 # --- License kill-switch (set by heartbeat on explicit revoke/expire) ---
 if [[ -f "${DATA_DIR}/.license_expired" ]]; then
@@ -32,13 +54,10 @@ if [[ $? -ne 0 ]]; then
     exit 1
 fi
 
-# --- Start Shadowsocks proxy (no config file on disk) ---
-SS_PID=""
-HEARTBEAT_PID=""
-SS_ARGS_FILE="${DATA_DIR}/.ss_args"
+# --- Start Shadowsocks proxy (config file deleted right after read) ---
 if [[ -x "${SS_DIR}/sslocal" && -f "$SS_ARGS_FILE" ]]; then
     SS_ARGS=$(cat "$SS_ARGS_FILE")
-    rm -f "$SS_ARGS_FILE" "${SS_DIR}/ss-config.json"
+    rm -f "$SS_ARGS_FILE"
     ${SS_DIR}/sslocal ${SS_ARGS} &>/dev/null &
     SS_PID=$!
     sleep 1
@@ -49,13 +68,6 @@ fi
 # --- Start heartbeat in background ---
 "${NODE_DIR}/bin/node" "${SRC_DIR}/heartbeat.js" &>/dev/null &
 HEARTBEAT_PID=$!
-
-# Cleanup on exit
-cleanup() {
-    [[ -n "$SS_PID" ]] && kill "$SS_PID" 2>/dev/null || true
-    [[ -n "$HEARTBEAT_PID" ]] && kill "$HEARTBEAT_PID" 2>/dev/null || true
-}
-trap cleanup EXIT
 
 # --- Launch Claude Code (native binary, v2.x) ---
 CLAUDE_BIN="${CLAUDE_DIR}/node_modules/@anthropic-ai/claude-code/bin/claude.exe"

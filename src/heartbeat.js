@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * Heartbeat daemon (v1.0.5+) — HTTPS w/ SPKI pin + Bearer auth.
+ * Heartbeat daemon (v1.0.7+) — HTTPS w/ SPKI pin + Bearer auth.
  * Runs in background, pings license server every 60 min.
- * Writes .license_expired flag on explicit revoke/expire; stays quiet on network errors.
+ * Writes .license_expired flag (in DATA_DIR) on explicit revoke/expire.
  */
 
 const fs = require("fs");
@@ -13,7 +13,8 @@ const https = require("https");
 const SPKI_PIN = "__SPKI_PIN__";
 
 const DATA_DIR = process.env.CLAUDE_PORTABLE_DATA || path.join(__dirname, "..", "data");
-const HEARTBEAT_FILE = path.join(DATA_DIR, ".heartbeat.json");
+const CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || path.join(DATA_DIR, ".claude");
+const HEARTBEAT_FILE = path.join(CONFIG_DIR, ".heartbeat.json");
 const KILL_FLAG = path.join(DATA_DIR, ".license_expired");
 
 try { fs.unlinkSync(KILL_FLAG); } catch {}
@@ -75,11 +76,11 @@ async function doHeartbeat() {
     const resp = await httpsPost(server, "/api/heartbeat", { mac }, code);
     if (resp === null) continue;           // network / TLS — try next server
     if (resp.ok && resp.body?.ok) return;  // happy path
-    // 404 or any non-ok: explicit refusal → license no longer valid for us.
+    // 404 or any non-ok: explicit refusal → license no longer valid
     fs.writeFileSync(KILL_FLAG, `License refused (HTTP ${resp.status || "?"})`);
     return;
   }
-  // all servers network-unreachable → stay quiet, try again next tick
+  // all servers unreachable → stay quiet, try again next tick
 }
 
 doHeartbeat();

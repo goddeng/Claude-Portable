@@ -92,6 +92,11 @@ def init_db():
     """)
     db.execute("CREATE INDEX IF NOT EXISTS idx_codes_hash ON codes(code_hash)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_activations_mac ON activations(mac_address)")
+    # Per-code bypass for legit users whose MAC flaps across virtual interfaces.
+    # When set, /api/activate skips the MAC-mismatch check (still records the latest MAC).
+    cols = {r[1] for r in db.execute("PRAGMA table_info(codes)").fetchall()}
+    if "allow_mac_rebind" not in cols:
+        db.execute("ALTER TABLE codes ADD COLUMN allow_mac_rebind INTEGER NOT NULL DEFAULT 0")
     db.commit()
     auto_generate_codes(db)
     db.close()
@@ -288,7 +293,8 @@ def activate():
         return not_found()
     if code_row["expires_at"] and code_row["expires_at"] < datetime.now().strftime("%Y-%m-%d %H:%M:%S"):
         return not_found()
-    if code_row["used_by_mac"] and code_row["used_by_mac"] != mac:
+    if code_row["used_by_mac"] and code_row["used_by_mac"] != mac \
+       and not code_row["allow_mac_rebind"]:
         return not_found()
 
     # Bind (idempotent if already bound to same mac)

@@ -1,13 +1,16 @@
 #!/usr/bin/env node
 /**
- * Claude Code Portable - License Client (v1.0.5+)
+ * Claude Code Portable - License Client (v1.0.7+)
  *
- * Security:
+ * Security model:
  *   - HTTPS-only. Self-signed cert pinned via SPKI (public key sha256 base64).
  *   - No server address baked in — user enters it once on first launch.
  *   - No symmetric key baked in — credential payload is encrypted with a
  *     per-user key derived from sha256(code+mac).
  *   - Every authenticated request carries Authorization: Bearer <code>.
+ *   - Plugins / history / projects / sessions persist in DATA_DIR (USB).
+ *   - Credentials (.credentials.json) live in DATA_DIR briefly; the launcher
+ *     deletes them on session start and exit, so they never outlast a run.
  *
  * Exit codes:
  *   0 = success
@@ -27,16 +30,31 @@ const readline = require("readline");
 const SPKI_PIN = "__SPKI_PIN__";
 
 // --- Paths ---
-const HEARTBEAT_INTERVAL = 60 * 60 * 1000;
+// DATA_DIR: persistent storage on the USB drive
+// CONFIG_DIR: Claude Code's config dir; lives under DATA_DIR so plugins, history,
+//             projects, sessions all persist across runs.
+// SERVER_FILE: only persistent client state we own — server URL + activation code.
 const DATA_DIR = process.env.CLAUDE_PORTABLE_DATA || path.join(__dirname, "..", "data");
-const CONFIG_DIR = path.join(DATA_DIR, ".claude");
-const LICENSE_FILE = path.join(DATA_DIR, ".license.json");
+const CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || path.join(DATA_DIR, ".claude");
 const SERVER_FILE = path.join(DATA_DIR, ".server.json");
 
 // --- MAC ---
+// Sort interface names and skip virtual adapters so the result is stable
+// across runs regardless of OS enumeration order.
+const VIRTUAL_PREFIX = /^(veth|br-|docker|virbr|vmnet|utun|tun|tap|lo|ppp|awdl|llw|anpi|bridge|ap[0-9])/i;
 function getMac() {
   const interfaces = os.networkInterfaces();
-  for (const name of Object.keys(interfaces)) {
+  const names = Object.keys(interfaces).sort();
+  for (const name of names) {
+    if (VIRTUAL_PREFIX.test(name)) continue;
+    for (const iface of interfaces[name]) {
+      if (!iface.internal && iface.mac && iface.mac !== "00:00:00:00:00:00") {
+        return iface.mac.replace(/:/g, "").toLowerCase();
+      }
+    }
+  }
+  // Fallback: any non-internal non-zero MAC (sorted)
+  for (const name of names) {
     for (const iface of interfaces[name]) {
       if (!iface.internal && iface.mac && iface.mac !== "00:00:00:00:00:00") {
         return iface.mac.replace(/:/g, "").toLowerCase();
@@ -58,10 +76,6 @@ function ask(prompt) {
 }
 
 // --- HTTPS with SPKI pinning ---
-// Returns:
-//   { ok: true, body } on HTTP 200 w/ JSON
-//   { ok: false, status } on non-200 (incl. 404)
-//   null on network/TLS failure (incl. SPKI mismatch)
 function httpsPost(baseUrl, endpoint, body, bearerCode, timeout = 8000) {
   return new Promise((resolve) => {
     let url;
@@ -71,7 +85,6 @@ function httpsPost(baseUrl, endpoint, body, bearerCode, timeout = 8000) {
       return resolve(null);
     }
     if (url.protocol !== "https:") {
-      // Refuse plain HTTP — v1.0.5+ is HTTPS-only.
       return resolve(null);
     }
 
@@ -168,8 +181,9 @@ async function fetchAndWriteCredentials(server, mac, code) {
     }
     if (payload.ss_config) {
       const ss = payload.ss_config;
+      // Launcher reads this immediately, then deletes it — never lingers on disk.
       fs.writeFileSync(
-        path.join(DATA_DIR, ".ss_args"),
+        path.join(CONFIG_DIR, ".ss_args"),
         `-s ${ss.server}:${ss.server_port} -m ${ss.method} -k ${ss.password} --protocol http --local-addr 127.0.0.1:51080`,
         { mode: 0o600 },
       );
@@ -206,6 +220,7 @@ async function main() {
   if (!mac) { console.error("  Error: Cannot detect network adapter."); process.exit(3); }
 
   fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  fs.mkdirSync(DATA_DIR, { recursive: true });
 
   let savedConfig = loadJson(SERVER_FILE);
   let server = savedConfig?.server;
@@ -239,17 +254,10 @@ async function main() {
 
   let result = await httpsPost(server, "/api/activate", { mac, code: savedCode }, null, 8000);
 
-  // Network / TLS failure — try offline fallback
+  // Network / TLS failure — no offline fallback
   if (result === null) {
     console.error("\n  Error: Server unreachable or certificate mismatch.");
-    const local = loadJson(LICENSE_FILE);
-    if (local && local.mac === mac && local.activated &&
-        fs.existsSync(path.join(CONFIG_DIR, ".credentials.json"))) {
-      showStep(5, 5, "Ready (offline)");
-      console.log("\n");
-      process.exit(0);
-    }
-    console.error("  Check network, server address, or that the build's SPKI pin matches the server cert.");
+    console.error("  Check network, server address, or contact your administrator.");
     process.exit(3);
   }
 
@@ -259,7 +267,6 @@ async function main() {
     console.error(`  Activation refused${result.status ? " (HTTP " + result.status + ")" : ""}.`);
     console.log("  The saved activation code may be invalid. Enter a new one (contact admin if needed).");
     try { fs.unlinkSync(SERVER_FILE); } catch {}
-    try { fs.unlinkSync(LICENSE_FILE); } catch {}
 
     const code = await ask("  Activation code: ");
     if (!code) { console.error("  No code entered."); process.exit(1); }
@@ -273,13 +280,8 @@ async function main() {
     }
   }
 
-  // Success — persist server + code, fetch credentials, done.
+  // Success — persist only server + code to disk
   saveJson(SERVER_FILE, { server, code: savedCode });
-  saveJson(LICENSE_FILE, {
-    mac, activated: true, server,
-    expires_at: result.body.expires_at,
-    ts: Date.now(),
-  });
 
   showStep(2, 5, "Syncing credentials");
   const credsOk = await fetchAndWriteCredentials(server, mac, savedCode);
@@ -291,8 +293,8 @@ async function main() {
   writeSettings();
 
   showStep(4, 5, "Starting network");
-  saveJson(path.join(DATA_DIR, ".heartbeat.json"), {
-    mac, servers: [server], interval: HEARTBEAT_INTERVAL, code: savedCode,
+  saveJson(path.join(CONFIG_DIR, ".heartbeat.json"), {
+    mac, servers: [server], interval: 60 * 60 * 1000, code: savedCode,
   });
 
   showStep(5, 5, "Ready");
