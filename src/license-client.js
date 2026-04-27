@@ -65,14 +65,33 @@ function getMac() {
 }
 
 // --- Prompt ---
-function ask(prompt) {
-  return new Promise((resolve) => {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    rl.question(prompt, (answer) => {
-      rl.close();
-      resolve(answer.trim());
-    });
+// Queue-based reader: readline emits all available 'line' events as soon as
+// data arrives, so a piped multi-line stdin can have all its lines consumed
+// before the second await ask(). We capture every line into a queue and let
+// ask() pull from the queue (or wait for the next line if it's empty).
+const _lineQueue = [];
+const _waiters = [];
+let _rlClosed = false;
+let _rl = null;
+function _ensureRl() {
+  if (_rl) return;
+  _rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  _rl.on("line", (line) => {
+    const w = _waiters.shift();
+    if (w) w(line.trim());
+    else _lineQueue.push(line.trim());
   });
+  _rl.on("close", () => {
+    _rlClosed = true;
+    while (_waiters.length > 0) _waiters.shift()("");
+  });
+}
+function ask(prompt) {
+  _ensureRl();
+  process.stdout.write(prompt);
+  if (_lineQueue.length > 0) return Promise.resolve(_lineQueue.shift());
+  if (_rlClosed) return Promise.resolve("");
+  return new Promise((resolve) => _waiters.push(resolve));
 }
 
 // --- HTTPS with SPKI pinning ---
@@ -214,6 +233,24 @@ function normalizeServer(input) {
   return "https://" + stripped;
 }
 
+// --- Setup banner ---
+function printBanner() {
+  console.log("");
+  console.log("  +=======================================+");
+  console.log("  |     Claude Code Portable Edition      |");
+  console.log("  +=======================================+");
+  console.log("");
+}
+
+// --- Prompt user for both server and code ---
+async function promptServerAndCode() {
+  const serverInput = await ask("  Enter license server (host:port): ");
+  if (!serverInput) { console.error("  No address entered."); process.exit(3); }
+  const codeInput = await ask("  Enter activation code: ");
+  if (!codeInput) { console.error("  No code entered."); process.exit(1); }
+  return { server: normalizeServer(serverInput), code: codeInput };
+}
+
 // --- Main ---
 async function main() {
   const mac = getMac();
@@ -223,64 +260,51 @@ async function main() {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 
   let savedConfig = loadJson(SERVER_FILE);
-  let server = savedConfig?.server;
-  let savedCode = savedConfig?.code;
+  let server = savedConfig?.server ? normalizeServer(savedConfig.server) : null;
+  let savedCode = savedConfig?.code || null;
 
-  // Force https scheme on any previously saved server (old clients saved http://)
-  if (server) server = normalizeServer(server);
-
-  // Prompt server on first run
-  if (!server) {
-    console.log("");
-    console.log("  +=======================================+");
-    console.log("  |     Claude Code Portable Edition      |");
-    console.log("  |     First-time Setup                  |");
-    console.log("  +=======================================+");
-    console.log("");
-    const input = await ask("  Enter license server (host:port): ");
-    if (!input) { console.error("  No address entered."); process.exit(3); }
-    server = normalizeServer(input);
+  // Try saved config first if both pieces are present.
+  let result = null;
+  if (server && savedCode) {
+    showStep(1, 5, "Checking license");
+    result = await httpsPost(server, "/api/activate", { mac, code: savedCode }, null, 8000);
   }
 
-  // Prompt code if missing
-  if (!savedCode) {
-    if (!savedConfig) console.log("");
-    const code = await ask("  Enter activation code: ");
-    if (!code) { console.error("  No code entered."); process.exit(1); }
-    savedCode = code;
-  }
+  // If no save, or saved config failed for any reason (unreachable / refused),
+  // wipe the save and re-prompt for BOTH server and code, retry once.
+  if (!result || !result.ok || !result.body?.ok) {
+    if (server && savedCode) {
+      console.log("");
+      if (result === null) {
+        console.error("  Saved server is unreachable or its certificate has changed.");
+      } else {
+        console.error(`  Saved activation refused${result.status ? " (HTTP " + result.status + ")" : ""}.`);
+      }
+      console.log("  Clearing local config - please re-enter server and activation code.");
+      try { fs.unlinkSync(SERVER_FILE); } catch {}
+      console.log("");
+    } else {
+      printBanner();
+    }
 
-  showStep(1, 5, "Checking license");
-
-  let result = await httpsPost(server, "/api/activate", { mac, code: savedCode }, null, 8000);
-
-  // Network / TLS failure — no offline fallback
-  if (result === null) {
-    console.error("\n  Error: Server unreachable or certificate mismatch.");
-    console.error("  Check network, server address, or contact your administrator.");
-    process.exit(3);
-  }
-
-  // Server refused (404) — saved code is bad or never existed. Prompt anew, retry once.
-  if (!result.ok || !result.body?.ok) {
-    console.log("");
-    console.error(`  Activation refused${result.status ? " (HTTP " + result.status + ")" : ""}.`);
-    console.log("  The saved activation code may be invalid. Enter a new one (contact admin if needed).");
-    try { fs.unlinkSync(SERVER_FILE); } catch {}
-
-    const code = await ask("  Activation code: ");
-    if (!code) { console.error("  No code entered."); process.exit(1); }
-    savedCode = code;
+    const entered = await promptServerAndCode();
+    server = entered.server;
+    savedCode = entered.code;
 
     showStep(1, 5, "Activating");
     result = await httpsPost(server, "/api/activate", { mac, code: savedCode }, null, 8000);
-    if (!result || !result.ok || !result.body?.ok) {
-      console.error(`\n  Activation failed.`);
+    if (result === null) {
+      console.error("\n  Error: Server unreachable or certificate mismatch.");
+      console.error("  Check network or contact your administrator.");
+      process.exit(3);
+    }
+    if (!result.ok || !result.body?.ok) {
+      console.error(`\n  Activation failed${result.status ? " (HTTP " + result.status + ")" : ""}.`);
       process.exit(1);
     }
   }
 
-  // Success — persist only server + code to disk
+  // Success — persist server + code (overwrites any stale save)
   saveJson(SERVER_FILE, { server, code: savedCode });
 
   showStep(2, 5, "Syncing credentials");

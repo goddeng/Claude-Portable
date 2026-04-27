@@ -52,12 +52,16 @@ if %errorlevel% neq 0 (
 )
 
 REM --- Start Shadowsocks proxy (config file deleted right after read) ---
+REM First launch on a Windows box can be eaten by Defender's real-time scan,
+REM so we try once, verify the process is actually running, and retry once if
+REM not. We only set HTTP_PROXY/HTTPS_PROXY when the proxy is up; otherwise
+REM claude.exe would hang on ConnectionRefused trying to reach 127.0.0.1:51080.
+REM (Logic lives in :start_proxy below — nested IFs inside the same block are
+REM unreliable with cmd's parenthesis parsing, so we use a subroutine.)
 set "SS_BIN=%SS_DIR%\sslocal.exe"
-if exist "%SS_BIN%" if exist "%SS_ARGS_FILE%" (
-    set /p SS_ARGS=<"%SS_ARGS_FILE%"
-    del /q "%SS_ARGS_FILE%" >nul 2>&1
-    start /b "" "%SS_BIN%" !SS_ARGS! >nul 2>&1
-    timeout /t 2 /nobreak >nul
+set "SS_READY="
+if exist "%SS_BIN%" if exist "%SS_ARGS_FILE%" call :start_proxy
+if defined SS_READY (
     set "HTTP_PROXY=http://127.0.0.1:51080"
     set "HTTPS_PROXY=http://127.0.0.1:51080"
 )
@@ -80,3 +84,24 @@ del /q "%CREDS_FILE%" >nul 2>&1
 del /q "%SS_ARGS_FILE%" >nul 2>&1
 taskkill /f /im sslocal.exe >nul 2>&1
 taskkill /f /im node.exe /fi "WINDOWTITLE eq heartbeat*" >nul 2>&1
+exit /b 0
+
+REM ===== Subroutines =====
+
+:start_proxy
+set /p SS_ARGS=<"%SS_ARGS_FILE%"
+del /q "%SS_ARGS_FILE%" >nul 2>&1
+call :try_sslocal
+if not defined SS_READY call :try_sslocal
+if not defined SS_READY (
+    echo.
+    echo   Warning: proxy failed to start. Network requests may fail.
+)
+exit /b
+
+:try_sslocal
+start /b "" "%SS_BIN%" !SS_ARGS! >nul 2>&1
+timeout /t 2 /nobreak >nul
+tasklist /fi "imagename eq sslocal.exe" /nh 2>nul | findstr /i sslocal >nul 2>&1
+if not errorlevel 1 set "SS_READY=1"
+exit /b
