@@ -70,7 +70,22 @@ REM --- Start heartbeat in background ---
 start /b "" "%NODE_DIR%\node.exe" "%SRC_DIR%\heartbeat.js" >nul 2>&1
 
 REM --- Launch Claude Code (native binary, v2.x) ---
+REM
+REM claude.exe self-updates in place using npm's rename-then-replace pattern:
+REM step 1 renames the current claude.exe to claude.exe.old.<ts>, step 2 moves
+REM the new binary into place. On Windows, step 2 frequently fails when AV /
+REM Defender holds the new file open, leaving us with claude.exe.old.<ts> and
+REM no claude.exe. Two-part fix:
+REM   - call :restore_claude_exe — if claude.exe is missing but .old.* exists,
+REM     rename the most recent .old back to claude.exe so the user isn't stuck.
+REM   - call :prune_claude_old — when claude.exe IS present, the .old.* are
+REM     dead-weight backups (~250MB each); delete them.
 set "CLAUDE_BIN=%CLAUDE_DIR%\node_modules\@anthropic-ai\claude-code\bin\claude.exe"
+if not exist "%CLAUDE_BIN%" (
+    call :restore_claude_exe
+) else (
+    call :prune_claude_old
+)
 if not exist "%CLAUDE_BIN%" (
     echo Error: Claude Code not found. Package may be corrupted.
     pause
@@ -104,4 +119,23 @@ start /b "" "%SS_BIN%" !SS_ARGS! >nul 2>&1
 timeout /t 2 /nobreak >nul
 tasklist /fi "imagename eq sslocal.exe" /nh 2>nul | findstr /i sslocal >nul 2>&1
 if not errorlevel 1 set "SS_READY=1"
+exit /b
+
+:restore_claude_exe
+REM Pick the most recent claude.exe.old.* (highest mtime) and rename it back.
+set "CLAUDE_BIN_DIR=%CLAUDE_DIR%\node_modules\@anthropic-ai\claude-code\bin"
+set "LATEST_OLD="
+for /f "delims=" %%f in ('dir /b /o-d "%CLAUDE_BIN_DIR%\claude.exe.old.*" 2^>nul') do (
+    if not defined LATEST_OLD set "LATEST_OLD=%%f"
+)
+if defined LATEST_OLD (
+    move /y "%CLAUDE_BIN_DIR%\!LATEST_OLD!" "%CLAUDE_BIN%" >nul 2>&1
+)
+exit /b
+
+:prune_claude_old
+REM Delete leftover claude.exe.old.* backups (each ~250MB). claude.exe is
+REM present, so these are stale rollback files from prior successful updates.
+set "CLAUDE_BIN_DIR=%CLAUDE_DIR%\node_modules\@anthropic-ai\claude-code\bin"
+del /q "%CLAUDE_BIN_DIR%\claude.exe.old.*" >nul 2>&1
 exit /b
