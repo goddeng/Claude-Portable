@@ -25,6 +25,12 @@ from datetime import datetime, timedelta
 from functools import wraps
 
 from flask import Flask, Response, abort, g, jsonify, request
+from werkzeug.serving import WSGIRequestHandler
+
+# Drop connections that don't complete TLS handshake / first request within 10s.
+# Without this, slow-loris-style TCP scanners can pile up connections that hold
+# Flask threads waiting on bytes that never arrive (caused a full hang once).
+WSGIRequestHandler.timeout = 10
 
 app = Flask(__name__)
 
@@ -425,4 +431,5 @@ if __name__ == "__main__":
     print(f"[LICENSE] TLS cert: {TLS_CERT}")
     print(f"[LICENSE] HTTPS  on {LISTEN_HOST}:{LISTEN_PORT}")
     app.run(host=LISTEN_HOST, port=LISTEN_PORT,
-            ssl_context=(TLS_CERT, TLS_KEY), debug=False)
+            ssl_context=(TLS_CERT, TLS_KEY), debug=False,
+            threaded=True)
